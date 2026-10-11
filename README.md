@@ -11,11 +11,14 @@ Under the assumptions below, running more times preserves **expected profit**, w
 
 ## Features
 
-- Exact theoretical EV, session SD, variance and SD ratios
+- Exact theoretical EV shared by both strategies, plus variance and SD reduction cards
+- Overlaid profit distributions with common bins, stable colors, EV and break-even markers
+- Simulated probabilities of finishing with a loss, break-even or profit
 - Seeded Monte Carlo means, deviations from EV and standard errors
 - Comparable histograms, discrete empirical CDFs and risk percentiles
 - Explicit session/hand units and deterministic edge cases
 - Submitted scenarios remain visible until another simulation is submitted
+- Compact two-column tables; Monte Carlo diagnostics and percentiles in Statistical details
 
 ## Demo
 
@@ -48,6 +51,10 @@ Real boards dealt without replacement from one deck can be dependent. The indepe
 - T means simulated **sessions**, not individual all-ins.
 - Monte Carlo standard error measures error in estimating the mean; it is not the spread of poker results. Roughly EV ±1.96 SE is a normal-approximation 95% sampling band for the simulated mean; rare outcomes can make this approximation poor.
 - Histograms use common bin edges and display probability mass per bin, not density or exact outcome probabilities.
+- The main cards show reductions: `1 − 1/r` for variance and `1 − 1/sqrt(r)` for SD. At zero variance both reductions are undefined (N/A). One run has 0% reduction when variance is positive.
+- The histogram overlays both samples in blue/orange. EV is shared by both strategies. If EV is exactly zero, one reference line is labeled "EV = break-even"; otherwise both reference lines are shown.
+- Final loss, break-even and profit probabilities are Monte Carlo frequencies and may not sum to exactly 100% after display rounding. They describe final profit, not ruin or drawdown during the session.
+- Outcome classification compares the **integer number of wins** to the exact break-even threshold implied by the input's decimal rake percentage. It does not use a tolerance around floating-point profit. Thus a tiny mathematical gain or loss is not classified as break-even, even if the displayed profit rounds to zero. Exactly break-even outcomes are set to zero in the plotted samples too, removing floating-point residuals without changing the model or sampling.
 - The step CDF is P(session result ≤ X). At zero it includes break-even sessions as well as losses. Duplicate outcomes are aggregated and the tails run from 0 to 1.
 - Percentiles use the inverse empirical CDF, so reported values are observed outcomes. They are not confidence intervals for EV.
 - These are final session profits, not within-session drawdowns or risk-of-ruin paths.

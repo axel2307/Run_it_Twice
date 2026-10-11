@@ -5,10 +5,11 @@ from fractions import Fraction
 from itertools import product
 from math import sqrt
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from simulation import SimulationConfig, simulate, theory
+from simulation import OutcomeCounts, SimulationConfig, simulate, theory
 
 
 class TheoryTests(unittest.TestCase):
@@ -86,6 +87,8 @@ class SimulationTests(unittest.TestCase):
         after = np.random.get_state()
         np.testing.assert_array_equal(first.once, second.once)
         np.testing.assert_array_equal(first.multiple, second.multiple)
+        self.assertEqual(first.once_outcomes, second.once_outcomes)
+        self.assertEqual(first.multiple_outcomes, second.multiple_outcomes)
         self.assertEqual(before[0], after[0])
         np.testing.assert_array_equal(before[1], after[1])
         self.assertEqual(before[2:], after[2:])
@@ -96,6 +99,7 @@ class SimulationTests(unittest.TestCase):
     def test_run_once_comparison_is_identical(self):
         result = simulate(SimulationConfig(trials=1000, run_times=1))
         np.testing.assert_array_equal(result.once, result.multiple)
+        self.assertEqual(result.once_outcomes, result.multiple_outcomes)
 
     def test_pot_scale_cancels_in_contribution_units(self):
         smallest = SimulationConfig(trials=1000, pot=0.01, rake_pct=12.25)
@@ -104,6 +108,8 @@ class SimulationTests(unittest.TestCase):
         result_large = simulate(largest)
         np.testing.assert_array_equal(result_small.once, result_large.once)
         np.testing.assert_array_equal(result_small.multiple, result_large.multiple)
+        self.assertEqual(result_small.once_outcomes, result_large.once_outcomes)
+        self.assertEqual(result_small.multiple_outcomes, result_large.multiple_outcomes)
         self.assertEqual(smallest.stake, 0.005)
         self.assertAlmostEqual(largest.net_pot, 877_500_000_000)
 
@@ -119,6 +125,9 @@ class SimulationTests(unittest.TestCase):
                 np.testing.assert_allclose(result.once, expected, rtol=0, atol=1e-10)
                 np.testing.assert_array_equal(result.once, result.multiple)
                 self.assertTrue(np.isfinite(result.once).all())
+                expected_counts = OutcomeCounts(1000, 0, 0) if equity == 0 else OutcomeCounts(0, 0, 1000)
+                self.assertEqual(result.once_outcomes, expected_counts)
+                self.assertEqual(result.multiple_outcomes, expected_counts)
 
     def test_small_horizon_support_includes_split_payouts(self):
         result = simulate(SimulationConfig(trials=50_000, allins=1, run_times=4))
@@ -155,6 +164,103 @@ class SimulationTests(unittest.TestCase):
             self.assertTrue(np.isfinite(sample).all())
             self.assertGreaterEqual(float(sample.min()), -50_000)
             self.assertLessEqual(float(sample.max()), 30_000)
+        for counts in (result.once_outcomes, result.multiple_outcomes):
+            self.assertEqual(counts.total, config.trials)
+            self.assertGreaterEqual(min(counts.loss, counts.break_even, counts.profit), 0)
+
+
+class OutcomeCountTests(unittest.TestCase):
+    def test_two_runs_have_loss_break_even_profit_probabilities(self):
+        config = SimulationConfig(trials=100_000, allins=1, run_times=2, equity=0.5, rake_pct=0)
+        result = simulate(config)
+        np.testing.assert_array_equal(np.unique(result.multiple), [-1.0, 0.0, 1.0])
+        self.assertEqual(result.once_outcomes.break_even, 0)
+        for counts, probabilities in (
+            (result.once_outcomes, (0.5, 0.0, 0.5)),
+            (result.multiple_outcomes, (0.25, 0.5, 0.25)),
+        ):
+            self.assertEqual(counts.total, config.trials)
+            for count, probability in zip((counts.loss, counts.break_even, counts.profit), probabilities):
+                if probability == 0:
+                    self.assertEqual(count, 0)
+                else:
+                    se = sqrt(probability * (1 - probability) / config.trials)
+                    self.assertLess(abs(count / config.trials - probability), 6 * se)
+        for sample, counts in ((result.once, result.once_outcomes), (result.multiple, result.multiple_outcomes)):
+            self.assertEqual(counts.loss, int(np.count_nonzero(sample < 0)))
+            self.assertEqual(counts.break_even, int(np.count_nonzero(sample == 0)))
+            self.assertEqual(counts.profit, int(np.count_nonzero(sample > 0)))
+
+    def test_exact_break_even_and_adjacent_rake_values(self):
+        # Nine $50 contributions cost $450. Five wins in $100 gross pots
+        # return $450 at 10% rake, with opposite signs immediately either side.
+        for rake, expected in (
+            (10.0, OutcomeCounts(0, 1000, 0)),
+            (10.0 + 1e-12, OutcomeCounts(1000, 0, 0)),
+            (10.0 - 1e-12, OutcomeCounts(0, 0, 1000)),
+        ):
+            with self.subTest(rake=rake), patch("simulation.np.random.default_rng") as rng:
+                rng.return_value.binomial.return_value = np.full(1000, 5, dtype=np.int64)
+                result = simulate(SimulationConfig(trials=1000, allins=9, run_times=1, rake_pct=rake))
+                self.assertEqual(result.once_outcomes, expected)
+                self.assertEqual(result.multiple_outcomes, expected)
+                for sample in (result.once, result.multiple):
+                    self.assertEqual(int(np.count_nonzero(sample < 0)), expected.loss)
+                    self.assertEqual(int(np.count_nonzero(sample == 0)), expected.break_even)
+                    self.assertEqual(int(np.count_nonzero(sample > 0)), expected.profit)
+
+    def test_exact_break_even_roundoff_does_not_shift_cdf_at_zero(self):
+        # In both fixtures K=200 is exact break-even; direct floating-point
+        # settlement otherwise leaves a positive residual of about 1e-14.
+        for hands, runs in ((133, 3), (399, 1)):
+            with self.subTest(hands=hands, runs=runs):
+                result = simulate(SimulationConfig(
+                    trials=50_000, allins=hands, run_times=runs,
+                    equity=0.5, rake_pct=0.25, seed=42,
+                ))
+                self.assertGreater(result.multiple_outcomes.break_even, 0)
+                for sample, counts in (
+                    (result.once, result.once_outcomes),
+                    (result.multiple, result.multiple_outcomes),
+                ):
+                    self.assertEqual(int(np.count_nonzero(sample == 0)), counts.break_even)
+                    self.assertEqual(int(np.count_nonzero(sample <= 0)), counts.loss + counts.break_even)
+
+    def test_tiny_rake_loss_is_preserved_when_float_profit_rounds_to_zero(self):
+        for rake in (1e-20, float(np.nextafter(0.0, 1.0))):
+            with self.subTest(rake=rake), patch("simulation.np.random.default_rng") as rng:
+                rng.return_value.binomial.side_effect = [
+                    np.zeros(1000, dtype=np.int64), np.ones(1000, dtype=np.int64)
+                ]
+                result = simulate(SimulationConfig(trials=1000, allins=1, run_times=2, rake_pct=rake))
+                np.testing.assert_array_equal(result.multiple, np.zeros(1000))
+                self.assertEqual(result.multiple_outcomes, OutcomeCounts(1000, 0, 0))
+
+    def test_counts_match_exact_currency_settlement_for_every_win_count(self):
+        # The oracle settles each distinct possible K using scalar rational
+        # dollars. It does not solve a threshold or inspect float profit arrays.
+        for hands, runs, rake in product((1, 9), range(1, 5), (0.0, 10.0, 10.0 - 1e-12, 10.0 + 1e-12, 20.0, 1e-20)):
+            with self.subTest(hands=hands, runs=runs, rake=rake):
+                config = SimulationConfig(trials=1000, allins=hands, run_times=runs, rake_pct=rake)
+                once_wins = np.resize(np.arange(hands + 1, dtype=np.int64), config.trials)
+                multiple_wins = np.resize(np.arange(hands * runs + 1, dtype=np.int64), config.trials)
+                with patch("simulation.np.random.default_rng") as rng:
+                    rng.return_value.binomial.side_effect = [once_wins, multiple_wins]
+                    result = simulate(config)
+                if runs == 1:
+                    multiple_wins = once_wins
+                for count_runs, wins, counts in (
+                    (1, once_wins, result.once_outcomes),
+                    (runs, multiple_wins, result.multiple_outcomes),
+                ):
+                    expected = {-1: 0, 0: 0, 1: 0}
+                    payout = Fraction(100) * (100 - Fraction(str(rake))) / (100 * count_runs)
+                    values, frequencies = np.unique(wins, return_counts=True)
+                    for wins_count, frequency in zip(values, frequencies):
+                        settled_profit = payout * int(wins_count) - hands * 50
+                        sign = (settled_profit > 0) - (settled_profit < 0)
+                        expected[sign] += int(frequency)
+                    self.assertEqual(counts, OutcomeCounts(expected[-1], expected[0], expected[1]))
 
 
 class ValidationTests(unittest.TestCase):
