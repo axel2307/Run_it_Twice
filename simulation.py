@@ -7,6 +7,7 @@ This model has no ties, card removal, rake cap, or currency rounding.
 """
 
 from dataclasses import dataclass
+from fractions import Fraction
 from math import isfinite, sqrt
 from numbers import Integral, Real
 
@@ -100,10 +101,50 @@ def theory(config: SimulationConfig, runs: int) -> Theory:
 
 
 @dataclass(frozen=True)
+class OutcomeCounts:
+    """Sample counts by the exact sign of the model's net horizon profit."""
+
+    loss: int
+    break_even: int
+    profit: int
+
+    @property
+    def total(self) -> int:
+        return self.loss + self.break_even + self.profit
+
+
+def _break_even_threshold(config: SimulationConfig, runs: int) -> Fraction:
+    """Exact winning-run count required to recover the initial contribution."""
+    rake = Fraction(str(config.rake_pct)) / 100
+    return Fraction(int(config.allins) * int(runs), 2) / (1 - rake)
+
+
+def _outcome_counts(wins: np.ndarray, config: SimulationConfig, runs: int) -> OutcomeCounts:
+    """Classify integer wins using the decimal rake input, without float signs.
+
+    Net profit is zero at K = N*r / (2*(1-rake)). Only an integer K can
+    break even. Rational arithmetic is confined to this scalar threshold;
+    array comparisons use its small integer floor, avoiding object arrays
+    and integer cross-products that could overflow.
+    """
+    threshold = _break_even_threshold(config, runs)
+    floor = threshold.numerator // threshold.denominator
+    if threshold.denominator == 1:
+        loss = int(np.count_nonzero(wins < floor))
+        break_even = int(np.count_nonzero(wins == floor))
+    else:
+        loss = int(np.count_nonzero(wins <= floor))
+        break_even = 0
+    return OutcomeCounts(loss, break_even, int(wins.size) - loss - break_even)
+
+
+@dataclass(frozen=True)
 class SimulationResult:
     config: SimulationConfig
     once: np.ndarray
     multiple: np.ndarray
+    once_outcomes: OutcomeCounts
+    multiple_outcomes: OutcomeCounts
 
 
 def simulate(config: SimulationConfig) -> SimulationResult:
@@ -112,16 +153,30 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     A local RNG makes each configuration reproducible without changing NumPy's
     global random state. Normalizing before sampling keeps the pot scale out
     of intermediate arithmetic. Identical r=1 scenarios share sample values.
+    Exact mathematical break-even outcomes are set to zero so roundoff cannot
+    move their probability mass to either side of zero in the charts.
     """
     rng = np.random.default_rng(config.seed)
     payout = 2 * (1 - config.rake_fraction)
     wins_once = rng.binomial(config.allins, config.equity, config.trials)
     once = payout * wins_once - config.allins
+    once_threshold = _break_even_threshold(config, 1)
+    if once_threshold.denominator == 1:
+        once[wins_once == once_threshold.numerator] = 0.0
+    once_outcomes = _outcome_counts(wins_once, config, 1)
     if config.run_times == 1:
         multiple = once.copy()
+        multiple_outcomes = once_outcomes
     else:
         wins_multiple = rng.binomial(
             config.run_times * config.allins, config.equity, config.trials
         )
         multiple = payout * (wins_multiple / config.run_times) - config.allins
-    return SimulationResult(config=config, once=once, multiple=multiple)
+        multiple_threshold = _break_even_threshold(config, config.run_times)
+        if multiple_threshold.denominator == 1:
+            multiple[wins_multiple == multiple_threshold.numerator] = 0.0
+        multiple_outcomes = _outcome_counts(wins_multiple, config, config.run_times)
+    return SimulationResult(
+        config=config, once=once, multiple=multiple,
+        once_outcomes=once_outcomes, multiple_outcomes=multiple_outcomes,
+    )
